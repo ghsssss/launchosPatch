@@ -15,7 +15,6 @@ python3 /Users/yaozaiyu/Downloads/LaunchOS-Keygen-Final/launchos_2_1_1_tool.py p
 ```
 
 脚本会做：
-
 1. 检查 App 版本必须是 `2.1.1(302)`
 2. 把 API 改到 `127.0.0.1:8765`
 3. 替换 `/Applications/LaunchOS.app/Contents/Resources/public.pem`
