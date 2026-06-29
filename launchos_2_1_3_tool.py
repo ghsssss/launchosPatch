@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
 """
-LaunchOS 2.1.1(302) patch + 本地注册机一体脚本。
+LaunchOS 2.1.3(362) patch + 本地注册机一体脚本。
 
 用法：
   只 patch App：
-    python3 launchos_2_1_1_tool.py patch
+    python3 launchos_2_1_3_tool.py patch
 
   只启动本地注册机服务：
-    python3 launchos_2_1_1_tool.py serve
+    python3 launchos_2_1_3_tool.py serve
 
   先 patch，再启动本地注册机服务：
-    python3 launchos_2_1_1_tool.py all
+    python3 launchos_2_1_3_tool.py all
 """
 
 import argparse
@@ -45,8 +45,8 @@ INFO = APP / "Contents/Info.plist"
 # 替换成和 PRIVATE_KEY 配套的 KEYGEN_PUBLIC_KEY。
 APP_PUBLIC_KEY = APP / "Contents/Resources/public.pem"
 
-EXPECTED_VERSION = "2.1.1"
-EXPECTED_BUILD = "302"
+EXPECTED_VERSION = "2.1.3"
+EXPECTED_BUILD = "362"
 
 
 # =========================
@@ -55,16 +55,17 @@ EXPECTED_BUILD = "302"
 
 # arm64 slice 信息来自：
 #   otool -f /Applications/LaunchOS.app/Contents/MacOS/LaunchOS
-ARM64_SLICE_OFFSET = 0x600000
+# 2.1.3(362) arm64 slice offset = 0x60c000。
+ARM64_SLICE_OFFSET = 0x60C000
 ARM64_VM_BASE = 0x100000000
 
 # 响应签名校验失败分支位置。
 # 反汇编附近：
-#   0x10005770c  bl  stringCompareWithSmolCheck
-#   0x100057710  mov x20, x0
-#   0x10005771c  tbz w20, #0x0, 0x100057730
-#   0x100057730  ... "network error: si "
-SIGCHECK_VA = 0x10005771C
+#   0x100063058  bl  stringCompareWithSmolCheck
+#   0x10006305c  mov x20, x0
+#   0x100063068  tbz w20, #0x0, 0x10006307c
+#   0x10006307c  ... "network error: si "
+SIGCHECK_VA = 0x100063068
 SIGCHECK_FILE_OFFSET = ARM64_SLICE_OFFSET + (SIGCHECK_VA - ARM64_VM_BASE)
 
 # arm64 指令：
@@ -289,7 +290,7 @@ def patch_app() -> None:
     build = plist_value("CFBundleVersion")
     print(f"LaunchOS version: {version} ({build})")
 
-    # offset 是 2.1.1(302) 专用的，版本不一致就退出。
+    # offset 是 2.1.3(362) 专用的，版本不一致就退出。
     if (version, build) != (EXPECTED_VERSION, EXPECTED_BUILD):
         raise SystemExit(
             f"unsupported version: {version} ({build}); "
@@ -313,7 +314,7 @@ def serve() -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="LaunchOS 2.1.1 patch + keygen tool")
+    parser = argparse.ArgumentParser(description="LaunchOS 2.1.3 patch + keygen tool")
     parser.add_argument(
         "command",
         choices=["patch", "serve", "all"],
