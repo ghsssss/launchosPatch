@@ -1,4 +1,4 @@
-# LaunchOS 2.1.3 注册机完整流程
+# LaunchOS 注册机完整流程
 
 ## 文件
 
@@ -15,26 +15,26 @@ python3 /Users/yaozaiyu/launchosPatch/launchos_2_1_3_tool.py patch
 ```
 
 脚本会做：
-1. 检查 App 版本必须是 `2.1.3(362)`
-2. 把 API 改到 `127.0.0.1:8765`
-3. 替换 `/Applications/LaunchOS.app/Contents/Resources/public.pem`
-4. patch 响应签名失败分支
-5. `xattr -cr`
-6. `codesign --force --deep --sign -`
+1. 读取当前 App 版本并输出
+2. 动态定位 arm64 响应签名失败分支偏移
+3. 把 API 改到 `127.0.0.1:8765`
+4. 替换 `/Applications/LaunchOS.app/Contents/Resources/public.pem`
+5. patch 响应签名失败分支
+6. `xattr -cr`
+7. `codesign --force --deep --sign -`
 
 ## patch 点
 
-2.1.3 响应签名失败分支：
+响应签名失败分支不再写死版本偏移。脚本会动态查找：
 
 ```text
-文件：/Applications/LaunchOS.app/Contents/MacOS/LaunchOS
-VA：0x100063068
-文件偏移：0x66f068
-原字节：b4000036
-新字节：1f2003d5
+1. 读取 fat Mach-O 的 arm64 slice offset
+2. 用 otool 找到 "network error: si " 附近的 stringCompareWithSmolCheck
+3. 定位其后的 tbz/nop 指令
+4. 通过 Mach-O __TEXT segment 把 VA 转成文件偏移
 ```
 
-含义：
+patch 含义：
 
 ```asm
 tbz w20, #0x0, 0x10006307c

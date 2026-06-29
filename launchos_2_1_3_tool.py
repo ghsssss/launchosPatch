@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-LaunchOS 2.1.3(362) patch + 本地注册机一体脚本。
+LaunchOS patch + 本地注册机一体脚本。
 
 用法：
   只 patch App：
@@ -19,6 +19,7 @@ import json
 import os
 import shutil
 import socketserver
+import struct
 import subprocess
 import tempfile
 import time
@@ -45,28 +46,19 @@ INFO = APP / "Contents/Info.plist"
 # 替换成和 PRIVATE_KEY 配套的 KEYGEN_PUBLIC_KEY。
 APP_PUBLIC_KEY = APP / "Contents/Resources/public.pem"
 
-EXPECTED_VERSION = "2.1.3"
-EXPECTED_BUILD = "362"
+DEFAULT_BUILD = "362"
 
 
 # =========================
 # patch 配置
 # =========================
 
-# arm64 slice 信息来自：
-#   otool -f /Applications/LaunchOS.app/Contents/MacOS/LaunchOS
-# 2.1.3(362) arm64 slice offset = 0x60c000。
-ARM64_SLICE_OFFSET = 0x60C000
-ARM64_VM_BASE = 0x100000000
-
-# 响应签名校验失败分支位置。
-# 反汇编附近：
-#   0x100063058  bl  stringCompareWithSmolCheck
-#   0x10006305c  mov x20, x0
-#   0x100063068  tbz w20, #0x0, 0x10006307c
-#   0x10006307c  ... "network error: si "
-SIGCHECK_VA = 0x100063068
-SIGCHECK_FILE_OFFSET = ARM64_SLICE_OFFSET + (SIGCHECK_VA - ARM64_VM_BASE)
+# 响应签名校验失败分支不再写死文件偏移。
+# 脚本会动态：
+#   1. 读取 fat Mach-O 的 arm64 slice offset；
+#   2. 用 otool 找到 "network error: si " 附近的 stringCompareWithSmolCheck；
+#   3. 定位其后的 tbz/nop 指令；
+#   4. 通过 Mach-O __TEXT segment 把 VA 转成文件偏移。
 
 # arm64 指令：
 #   b4000036 = tbz w20, #0, <fail_branch>
@@ -100,6 +92,101 @@ def plist_value(key: str) -> str:
         ["/usr/libexec/PlistBuddy", "-c", f"Print :{key}", str(INFO)],
         text=True,
     ).strip()
+
+
+def arm64_slice_offset(data: bytes) -> int:
+    """返回 fat Mach-O 里的 arm64 slice 文件偏移；非 fat arm64 返回 0。"""
+    magic = data[:4]
+    if magic == b"\xcf\xfa\xed\xfe":  # MH_MAGIC_64, little-endian
+        return 0
+    if magic != b"\xca\xfe\xba\xbe":
+        raise SystemExit("unsupported Mach-O format")
+
+    nfat = struct.unpack_from(">I", data, 4)[0]
+    off = 8
+    cpu_type_arm64 = 0x0100000C
+    for _ in range(nfat):
+        cputype, _cpusubtype, slice_off, _size, _align = struct.unpack_from(">IIIII", data, off)
+        if cputype == cpu_type_arm64:
+            return slice_off
+        off += 20
+    raise SystemExit("arm64 slice not found")
+
+
+def text_segment_info(data: bytes, slice_off: int) -> tuple[int, int, int, int]:
+    """返回 arm64 slice 的 __TEXT(vmaddr, vmsize, fileoff, filesize)。"""
+    if data[slice_off : slice_off + 4] != b"\xcf\xfa\xed\xfe":
+        raise SystemExit("arm64 slice is not MH_MAGIC_64")
+
+    ncmds = struct.unpack_from("<I", data, slice_off + 16)[0]
+    cmd_off = slice_off + 32
+    lc_segment_64 = 0x19
+
+    for _ in range(ncmds):
+        cmd, cmdsize = struct.unpack_from("<II", data, cmd_off)
+        if cmd == lc_segment_64:
+            raw_name = data[cmd_off + 8 : cmd_off + 24]
+            segname = raw_name.split(b"\x00", 1)[0]
+            if segname == b"__TEXT":
+                vmaddr, vmsize, fileoff, filesize = struct.unpack_from("<QQQQ", data, cmd_off + 24)
+                return vmaddr, vmsize, fileoff, filesize
+        cmd_off += cmdsize
+
+    raise SystemExit("__TEXT segment not found")
+
+
+def va_to_file_offset(data: bytes, va: int) -> int:
+    """把 otool 反汇编里的虚拟地址转成实际文件偏移。"""
+    slice_off = arm64_slice_offset(data)
+    vmaddr, vmsize, fileoff, filesize = text_segment_info(data, slice_off)
+    if not (vmaddr <= va < vmaddr + vmsize):
+        raise SystemExit(f"VA out of __TEXT range: {va:#x}")
+    delta = va - vmaddr
+    if delta >= filesize:
+        raise SystemExit(f"VA maps outside __TEXT file range: {va:#x}")
+    return slice_off + fileoff + delta
+
+
+def instruction_va(line: str) -> int | None:
+    line = line.strip()
+    if len(line) < 16:
+        return None
+    head = line.split(None, 1)[0]
+    if len(head) == 16 and all(c in "0123456789abcdefABCDEF" for c in head):
+        return int(head, 16)
+    return None
+
+
+def find_sigcheck_file_offset(data: bytes) -> int:
+    """动态定位响应签名校验分支的文件偏移。"""
+    disasm = subprocess.check_output(
+        ["otool", "-arch", "arm64", "-tV", str(BIN)],
+        text=True,
+        errors="replace",
+    )
+    lines = disasm.splitlines()
+
+    for err_idx, line in enumerate(lines):
+        if "network error: si" not in line:
+            continue
+
+        compare_idx = None
+        for i in range(err_idx - 1, max(-1, err_idx - 120), -1):
+            if "stringCompareWithSmolCheck" in lines[i]:
+                compare_idx = i
+                break
+        if compare_idx is None:
+            continue
+
+        # 原始版本是 tbz；已 patch 后是 nop。二者都视为同一个 patch 点。
+        for i in range(compare_idx + 1, err_idx):
+            text = lines[i].strip()
+            if "\ttbz" in lines[i] or text.endswith("\tnop") or text.endswith(" nop"):
+                va = instruction_va(lines[i])
+                if va is not None:
+                    return va_to_file_offset(data, va)
+
+    raise SystemExit("sigcheck branch not found")
 
 
 def b64url(data: bytes) -> str:
@@ -162,7 +249,7 @@ def make_token(req: dict) -> str:
         "tokenVersion": 1,
         "fingerprint": fingerprint,
         "tier": "pro",
-        "buildVersion": str(req.get("buildVersion") or EXPECTED_BUILD),
+        "buildVersion": str(req.get("buildVersion") or DEFAULT_BUILD),
         "trialStartedAt": 0,
         "licenseId": "KG-" + uuid.uuid5(uuid.NAMESPACE_DNS, email + "|" + license_key).hex[:16],
         "machineId": machine_id,
@@ -259,16 +346,17 @@ def patch_binary() -> None:
         if old_count:
             data = bytearray(bytes(data).replace(old, new))
 
-    current = bytes(data[SIGCHECK_FILE_OFFSET : SIGCHECK_FILE_OFFSET + 4])
-    print(f"sigcheck offset={SIGCHECK_FILE_OFFSET:#x} bytes={current.hex()}")
+    sigcheck_file_offset = find_sigcheck_file_offset(data)
+    current = bytes(data[sigcheck_file_offset : sigcheck_file_offset + 4])
+    print(f"sigcheck offset={sigcheck_file_offset:#x} bytes={current.hex()}")
 
     if current == TBZ_BYTES:
-        data[SIGCHECK_FILE_OFFSET : SIGCHECK_FILE_OFFSET + 4] = NOP_BYTES
+        data[sigcheck_file_offset : sigcheck_file_offset + 4] = NOP_BYTES
         print(f"sigcheck patched -> {NOP_BYTES.hex()}")
     elif current == NOP_BYTES:
         print("sigcheck already patched")
     else:
-        raise SystemExit(f"unexpected bytes at {SIGCHECK_FILE_OFFSET:#x}: {current.hex()}")
+        raise SystemExit(f"unexpected bytes at {sigcheck_file_offset:#x}: {current.hex()}")
 
     BIN.write_bytes(data)
 
@@ -290,13 +378,6 @@ def patch_app() -> None:
     build = plist_value("CFBundleVersion")
     print(f"LaunchOS version: {version} ({build})")
 
-    # offset 是 2.1.3(362) 专用的，版本不一致就退出。
-    if (version, build) != (EXPECTED_VERSION, EXPECTED_BUILD):
-        raise SystemExit(
-            f"unsupported version: {version} ({build}); "
-            f"expected {EXPECTED_VERSION} ({EXPECTED_BUILD})"
-        )
-
     patch_binary()
     replace_public_key()
     run(["xattr", "-cr", str(APP)])
@@ -314,7 +395,7 @@ def serve() -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="LaunchOS 2.1.3 patch + keygen tool")
+    parser = argparse.ArgumentParser(description="LaunchOS patch + keygen tool")
     parser.add_argument(
         "command",
         choices=["patch", "serve", "all"],
