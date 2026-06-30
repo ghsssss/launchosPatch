@@ -3,14 +3,9 @@
 LaunchOS patch + 本地注册机一体脚本。
 
 用法：
-  只 patch App：
-    python3 launchos_2_1_3_tool.py patch
-
-  只启动本地注册机服务：
-    python3 launchos_2_1_3_tool.py serve
-
-  先 patch，再启动本地注册机服务：
-    python3 launchos_2_1_3_tool.py all
+  python3 launchos_tool.py patch   # patch App
+  python3 launchos_tool.py serve   # 启动本地服务
+  python3 launchos_tool.py all     # patch 后启动本地服务
 """
 
 import argparse
@@ -27,59 +22,26 @@ import uuid
 from http.server import BaseHTTPRequestHandler
 from pathlib import Path
 
-
-# =========================
-# 通用路径配置
-# =========================
-
 ROOT = Path(__file__).resolve().parent
 WORK = ROOT / "launchos_keygen_work"
 PRIVATE_KEY = WORK / "private.pem"
-KEYGEN_PUBLIC_KEY = WORK / "public.pem"
+PUBLIC_KEY = WORK / "public.pem"
 
 APP = Path("/Applications/LaunchOS.app")
 BIN = APP / "Contents/MacOS/LaunchOS"
 INFO = APP / "Contents/Info.plist"
-
-# App 用这个公钥验证服务端返回的 JWT。
-# 注册机用 PRIVATE_KEY 签 JWT，所以这里必须把 App 内置 public.pem
-# 替换成和 PRIVATE_KEY 配套的 KEYGEN_PUBLIC_KEY。
 APP_PUBLIC_KEY = APP / "Contents/Resources/public.pem"
-
-DEFAULT_BUILD = "362"
-
-
-# =========================
-# patch 配置
-# =========================
-
-# 响应签名校验失败分支不再写死文件偏移。
-# 脚本会动态：
-#   1. 读取 fat Mach-O 的 arm64 slice offset；
-#   2. 用 otool 找到 "network error: si " 附近的 stringCompareWithSmolCheck；
-#   3. 定位其后的 tbz/nop 指令；
-#   4. 通过 Mach-O __TEXT segment 把 VA 转成文件偏移。
-
-# arm64 指令：
-#   b4000036 = tbz w20, #0, <fail_branch>
-#   1f2003d5 = nop
-TBZ_BYTES = bytes.fromhex("b4000036")
-NOP_BYTES = bytes.fromhex("1f2003d5")
-
-# API 字符串替换必须保持长度一致，避免破坏 Mach-O 字符串布局。
-REPLACEMENTS = [
-    (b"https://api.remixdesign.app/", b"http://127.000.000.001:8765/"),
-    (b"https://api.remixdesign.site/", b"http://127.000.000.001:8765//"),
-]
-
-
-# =========================
-# 注册机服务配置
-# =========================
 
 HOST = "127.0.0.1"
 PORT = 8765
 SUCCESS_CODE = 1000
+
+TBZ = bytes.fromhex("b4000036")
+NOP = bytes.fromhex("1f2003d5")
+REPLACEMENTS = (
+    (b"https://api.remixdesign.app/", b"http://127.000.000.001:8765/"),
+    (b"https://api.remixdesign.site/", b"http://127.000.000.001:8765//"),
+)
 
 
 def run(cmd: list[str]) -> None:
@@ -87,248 +49,183 @@ def run(cmd: list[str]) -> None:
     subprocess.check_call(cmd)
 
 
-def plist_value(key: str) -> str:
+def plist(key: str) -> str:
     return subprocess.check_output(
         ["/usr/libexec/PlistBuddy", "-c", f"Print :{key}", str(INFO)],
         text=True,
     ).strip()
 
 
-def arm64_slice_offset(data: bytes) -> int:
-    """返回 fat Mach-O 里的 arm64 slice 文件偏移；非 fat arm64 返回 0。"""
-    magic = data[:4]
-    if magic == b"\xcf\xfa\xed\xfe":  # MH_MAGIC_64, little-endian
-        return 0
-    if magic != b"\xca\xfe\xba\xbe":
-        raise SystemExit("unsupported Mach-O format")
-
-    nfat = struct.unpack_from(">I", data, 4)[0]
-    off = 8
-    cpu_type_arm64 = 0x0100000C
-    for _ in range(nfat):
-        cputype, _cpusubtype, slice_off, _size, _align = struct.unpack_from(">IIIII", data, off)
-        if cputype == cpu_type_arm64:
-            return slice_off
-        off += 20
-    raise SystemExit("arm64 slice not found")
+def b64url(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).decode().rstrip("=")
 
 
-def text_segment_info(data: bytes, slice_off: int) -> tuple[int, int, int, int]:
-    """返回 arm64 slice 的 __TEXT(vmaddr, vmsize, fileoff, filesize)。"""
-    if data[slice_off : slice_off + 4] != b"\xcf\xfa\xed\xfe":
-        raise SystemExit("arm64 slice is not MH_MAGIC_64")
-
-    ncmds = struct.unpack_from("<I", data, slice_off + 16)[0]
-    cmd_off = slice_off + 32
-    lc_segment_64 = 0x19
-
-    for _ in range(ncmds):
-        cmd, cmdsize = struct.unpack_from("<II", data, cmd_off)
-        if cmd == lc_segment_64:
-            raw_name = data[cmd_off + 8 : cmd_off + 24]
-            segname = raw_name.split(b"\x00", 1)[0]
-            if segname == b"__TEXT":
-                vmaddr, vmsize, fileoff, filesize = struct.unpack_from("<QQQQ", data, cmd_off + 24)
-                return vmaddr, vmsize, fileoff, filesize
-        cmd_off += cmdsize
-
-    raise SystemExit("__TEXT segment not found")
-
-
-def va_to_file_offset(data: bytes, va: int) -> int:
-    """把 otool 反汇编里的虚拟地址转成实际文件偏移。"""
-    slice_off = arm64_slice_offset(data)
-    vmaddr, vmsize, fileoff, filesize = text_segment_info(data, slice_off)
-    if not (vmaddr <= va < vmaddr + vmsize):
-        raise SystemExit(f"VA out of __TEXT range: {va:#x}")
-    delta = va - vmaddr
-    if delta >= filesize:
-        raise SystemExit(f"VA maps outside __TEXT file range: {va:#x}")
-    return slice_off + fileoff + delta
-
-
-def instruction_va(line: str) -> int | None:
-    line = line.strip()
-    if len(line) < 16:
-        return None
-    head = line.split(None, 1)[0]
+def parse_va(line: str) -> int | None:
+    head = line.strip().split(None, 1)[0]
     if len(head) == 16 and all(c in "0123456789abcdefABCDEF" for c in head):
         return int(head, 16)
     return None
 
 
-def find_sigcheck_file_offset(data: bytes) -> int:
-    """动态定位响应签名校验分支的文件偏移。"""
-    disasm = subprocess.check_output(
+def arm64_slice(data: bytes) -> int:
+    if data[:4] == b"\xcf\xfa\xed\xfe":
+        return 0
+    if data[:4] != b"\xca\xfe\xba\xbe":
+        raise SystemExit("unsupported Mach-O format")
+
+    for i in range(struct.unpack_from(">I", data, 4)[0]):
+        cputype, _, off, _, _ = struct.unpack_from(">IIIII", data, 8 + i * 20)
+        if cputype == 0x0100000C:
+            return off
+    raise SystemExit("arm64 slice not found")
+
+
+def text_segment(data: bytes, slice_off: int) -> tuple[int, int, int, int]:
+    if data[slice_off : slice_off + 4] != b"\xcf\xfa\xed\xfe":
+        raise SystemExit("arm64 slice is not MH_MAGIC_64")
+
+    off = slice_off + 32
+    for _ in range(struct.unpack_from("<I", data, slice_off + 16)[0]):
+        cmd, size = struct.unpack_from("<II", data, off)
+        segname = data[off + 8 : off + 24].split(b"\0", 1)[0]
+        if cmd == 0x19 and segname == b"__TEXT":
+            return struct.unpack_from("<QQQQ", data, off + 24)
+        off += size
+    raise SystemExit("__TEXT segment not found")
+
+
+def va_to_offset(data: bytes, va: int) -> int:
+    slice_off = arm64_slice(data)
+    vmaddr, vmsize, fileoff, filesize = text_segment(data, slice_off)
+    if not vmaddr <= va < vmaddr + min(vmsize, filesize):
+        raise SystemExit(f"VA out of __TEXT file range: {va:#x}")
+    return slice_off + fileoff + (va - vmaddr)
+
+
+def find_sigcheck_offset(data: bytes) -> int:
+    """定位 network error: si 前的响应签名校验分支。"""
+    lines = subprocess.check_output(
         ["otool", "-arch", "arm64", "-tV", str(BIN)],
         text=True,
         errors="replace",
-    )
-    lines = disasm.splitlines()
+    ).splitlines()
 
     for err_idx, line in enumerate(lines):
         if "network error: si" not in line:
             continue
 
-        compare_idx = None
-        for i in range(err_idx - 1, max(-1, err_idx - 120), -1):
-            if "stringCompareWithSmolCheck" in lines[i]:
-                compare_idx = i
-                break
-        if compare_idx is None:
+        block = lines[max(0, err_idx - 120) : err_idx]
+        if not any("stringCompareWithSmolCheck" in x for x in block):
             continue
 
-        # 原始版本是 tbz；已 patch 后是 nop。二者都视为同一个 patch 点。
-        for i in range(compare_idx + 1, err_idx):
-            text = lines[i].strip()
-            if "\ttbz" in lines[i] or text.endswith("\tnop") or text.endswith(" nop"):
-                va = instruction_va(lines[i])
+        for x in block:
+            if "\ttbz" in x or x.strip().endswith((" nop", "\tnop")):
+                va = parse_va(x)
                 if va is not None:
-                    return va_to_file_offset(data, va)
+                    return va_to_offset(data, va)
 
     raise SystemExit("sigcheck branch not found")
 
 
-def b64url(data: bytes) -> str:
-    return base64.urlsafe_b64encode(data).decode().rstrip("=")
-
-
-def der_to_raw_p1363(der: bytes) -> bytes:
-    """openssl 输出 DER ECDSA 签名；JWT ES256 需要 r||s 原始 64 字节。"""
+def der_to_raw(der: bytes) -> bytes:
     if len(der) < 8 or der[0] != 0x30:
         raise ValueError("not an ECDSA DER sequence")
 
-    pos = 2
-    if der[1] & 0x80:
-        n = der[1] & 0x7F
-        pos = 2 + n
-
+    pos = 2 + (der[1] & 0x7F if der[1] & 0x80 else 0)
     if der[pos] != 0x02:
         raise ValueError("bad r")
-    r_len = der[pos + 1]
-    r = der[pos + 2 : pos + 2 + r_len]
-    pos += 2 + r_len
+    r = der[pos + 2 : pos + 2 + der[pos + 1]]
+    pos += 2 + der[pos + 1]
 
     if der[pos] != 0x02:
         raise ValueError("bad s")
-    s_len = der[pos + 1]
-    s = der[pos + 2 : pos + 2 + s_len]
-
-    return r.lstrip(b"\x00").rjust(32, b"\x00") + s.lstrip(b"\x00").rjust(32, b"\x00")
+    s = der[pos + 2 : pos + 2 + der[pos + 1]]
+    return r.lstrip(b"\0").rjust(32, b"\0") + s.lstrip(b"\0").rjust(32, b"\0")
 
 
 def sign_es256(message: bytes) -> bytes:
-    """使用 private.pem 对 JWT signing input 做 ES256 签名。"""
-    with tempfile.NamedTemporaryFile(delete=False) as inp:
-        inp.write(message)
-        inp_path = inp.name
-
+    with tempfile.NamedTemporaryFile(delete=False) as f:
+        f.write(message)
+        path = f.name
     try:
-        der = subprocess.check_output(
-            ["openssl", "dgst", "-sha256", "-sign", str(PRIVATE_KEY), inp_path]
-        )
-        return der_to_raw_p1363(der)
+        der = subprocess.check_output(["openssl", "dgst", "-sha256", "-sign", str(PRIVATE_KEY), path])
+        return der_to_raw(der)
     finally:
         try:
-            os.unlink(inp_path)
+            os.unlink(path)
         except FileNotFoundError:
             pass
 
 
-def make_token(req: dict) -> str:
-    """为任意邮箱/许可证生成 LaunchOS 可接受的 Pro JWT。"""
+def make_token(req: dict) -> tuple[str, dict]:
     now = int(time.time())
     email = str(req.get("email") or "keygen@example.com")
-    license_key = str(req.get("key") or req.get("license") or req.get("licenseKey") or "KEYGEN")
+    key = str(req.get("key") or req.get("license") or req.get("licenseKey") or "KEYGEN")
     fingerprint = str(req.get("fingerprint") or "")
-    machine_id = str(req.get("machineId") or fingerprint or str(uuid.uuid4()))
 
-    header = {"alg": "ES256", "typ": "JWT"}
     payload = {
         "product": "LaunchOS",
         "tokenVersion": 1,
         "fingerprint": fingerprint,
         "tier": "pro",
-        "buildVersion": str(req.get("buildVersion") or DEFAULT_BUILD),
+        "buildVersion": str(req.get("buildVersion") or ""),
         "trialStartedAt": 0,
-        "licenseId": "KG-" + uuid.uuid5(uuid.NAMESPACE_DNS, email + "|" + license_key).hex[:16],
-        "machineId": machine_id,
+        "licenseId": "KG-" + uuid.uuid5(uuid.NAMESPACE_DNS, email + "|" + key).hex[:16],
+        "machineId": str(req.get("machineId") or fingerprint or uuid.uuid4()),
         "iss": "remixdesign.launchos",
         "aud": ["launchos-macos"],
         "iat": now,
         "exp": now + 10 * 365 * 24 * 3600,
     }
-
+    header = {"alg": "ES256", "typ": "JWT"}
     signing_input = (
         b64url(json.dumps(header, separators=(",", ":")).encode())
         + "."
         + b64url(json.dumps(payload, separators=(",", ":")).encode())
     ).encode()
-
-    return signing_input.decode() + "." + b64url(sign_es256(signing_input))
-
-
-def decode_payload_for_log(token: str) -> dict:
-    try:
-        payload = token.split(".")[1]
-        payload += "=" * (-len(payload) % 4)
-        return json.loads(base64.urlsafe_b64decode(payload.encode()))
-    except Exception as exc:
-        return {"decode_error": str(exc)}
+    return signing_input.decode() + "." + b64url(sign_es256(signing_input)), payload
 
 
-class LicenseHandler(BaseHTTPRequestHandler):
-    def _read_json(self) -> dict:
-        length = int(self.headers.get("content-length") or "0")
-        raw = self.rfile.read(length) if length else b"{}"
+class Handler(BaseHTTPRequestHandler):
+    def read_json(self) -> dict:
+        raw = self.rfile.read(int(self.headers.get("content-length") or 0)) or b"{}"
         try:
-            return json.loads(raw.decode() or "{}")
+            return json.loads(raw.decode())
         except Exception:
             return {}
 
-    def _send_json(self, obj: dict, status: int = 200) -> None:
-        data = json.dumps(obj, separators=(",", ":")).encode()
-
-        # 响应签名校验已经在 App 里 NOP 掉；这里保留占位头，避免缺头导致解析分支异常。
+    def send_json(self, obj: dict, status: int = 200) -> None:
+        body = json.dumps(obj, separators=(",", ":")).encode()
         self.send_response(status)
         self.send_header("content-type", "application/json")
-        self.send_header("content-length", str(len(data)))
+        self.send_header("content-length", str(len(body)))
         self.send_header("timestamp", str(int(time.time())))
         self.send_header("nonce", str(uuid.uuid4()).upper())
         self.send_header("signature", "patched")
         self.end_headers()
-        self.wfile.write(data)
+        self.wfile.write(body)
 
     def do_POST(self) -> None:
-        req = self._read_json()
+        req = self.read_json()
         print(f"POST {self.path} body={json.dumps(req, ensure_ascii=False)}")
 
         if "deactivate" in self.path:
-            self._send_json({"message": "", "code": SUCCESS_CODE, "data": {"ok": True}, "ok": True})
+            self.send_json({"message": "", "code": SUCCESS_CODE, "data": {"ok": True}, "ok": True})
             return
 
-        token = make_token(req)
-        print(
-            "RESP "
-            + json.dumps(
-                {"code": SUCCESS_CODE, "token_payload": decode_payload_for_log(token)},
-                ensure_ascii=False,
-            )
-        )
-        self._send_json({"message": "", "code": SUCCESS_CODE, "data": {"token": token}, "token": token})
+        token, payload = make_token(req)
+        print("RESP " + json.dumps({"code": SUCCESS_CODE, "token_payload": payload}, ensure_ascii=False))
+        self.send_json({"message": "", "code": SUCCESS_CODE, "data": {"token": token}, "token": token})
 
     def do_GET(self) -> None:
-        if "machines" in self.path:
-            data = {"maxMachineCount": 999, "activatedMachines": []}
-            self._send_json({"message": "", "code": SUCCESS_CODE, "data": data, **data})
-        else:
-            self._send_json({"message": "", "code": SUCCESS_CODE, "data": {"ok": True}, "ok": True})
+        data = {"maxMachineCount": 999, "activatedMachines": []} if "machines" in self.path else {"ok": True}
+        self.send_json({"message": "", "code": SUCCESS_CODE, "data": data, **data})
 
     def log_message(self, fmt: str, *args) -> None:
         print("[%s] %s" % (self.log_date_time_string(), fmt % args))
 
 
-class ReusableTCPServer(socketserver.TCPServer):
+class Server(socketserver.TCPServer):
     allow_reuse_address = True
 
 
@@ -338,48 +235,33 @@ def patch_binary() -> None:
     for old, new in REPLACEMENTS:
         if len(old) != len(new):
             raise SystemExit(f"replacement length mismatch: {old!r} -> {new!r}")
+        print(f"{old.decode()} old_count={data.count(old)} patched_count={data.count(new)}")
+        data = bytearray(bytes(data).replace(old, new))
 
-        old_count = data.count(old)
-        new_count = data.count(new)
-        print(f"{old.decode()} old_count={old_count} patched_count={new_count}")
+    off = find_sigcheck_offset(data)
+    cur = bytes(data[off : off + 4])
+    print(f"sigcheck offset={off:#x} bytes={cur.hex()}")
 
-        if old_count:
-            data = bytearray(bytes(data).replace(old, new))
-
-    sigcheck_file_offset = find_sigcheck_file_offset(data)
-    current = bytes(data[sigcheck_file_offset : sigcheck_file_offset + 4])
-    print(f"sigcheck offset={sigcheck_file_offset:#x} bytes={current.hex()}")
-
-    if current == TBZ_BYTES:
-        data[sigcheck_file_offset : sigcheck_file_offset + 4] = NOP_BYTES
-        print(f"sigcheck patched -> {NOP_BYTES.hex()}")
-    elif current == NOP_BYTES:
+    if cur == TBZ:
+        data[off : off + 4] = NOP
+        print(f"sigcheck patched -> {NOP.hex()}")
+    elif cur == NOP:
         print("sigcheck already patched")
     else:
-        raise SystemExit(f"unexpected bytes at {sigcheck_file_offset:#x}: {current.hex()}")
+        raise SystemExit(f"unexpected bytes at {off:#x}: {cur.hex()}")
 
     BIN.write_bytes(data)
 
 
-def replace_public_key() -> None:
-    shutil.copyfile(KEYGEN_PUBLIC_KEY, APP_PUBLIC_KEY)
-    print(f"public.pem replaced: {APP_PUBLIC_KEY}")
-
-
 def patch_app() -> None:
-    if not APP.exists():
-        raise SystemExit(f"missing app: {APP}")
-    if not BIN.exists():
-        raise SystemExit(f"missing binary: {BIN}")
-    if not KEYGEN_PUBLIC_KEY.exists():
-        raise SystemExit(f"missing keygen public key: {KEYGEN_PUBLIC_KEY}")
+    for path in (APP, BIN, PUBLIC_KEY):
+        if not path.exists():
+            raise SystemExit(f"missing: {path}")
 
-    version = plist_value("CFBundleShortVersionString")
-    build = plist_value("CFBundleVersion")
-    print(f"LaunchOS version: {version} ({build})")
-
+    print(f"LaunchOS version: {plist('CFBundleShortVersionString')} ({plist('CFBundleVersion')})")
     patch_binary()
-    replace_public_key()
+    shutil.copyfile(PUBLIC_KEY, APP_PUBLIC_KEY)
+    print(f"public.pem replaced: {APP_PUBLIC_KEY}")
     run(["xattr", "-cr", str(APP)])
     run(["codesign", "--force", "--deep", "--sign", "-", str(APP)])
     print("patch done")
@@ -387,25 +269,21 @@ def patch_app() -> None:
 
 def serve() -> None:
     if not PRIVATE_KEY.exists():
-        raise SystemExit(f"missing private key: {PRIVATE_KEY}")
+        raise SystemExit(f"missing: {PRIVATE_KEY}")
 
-    with ReusableTCPServer((HOST, PORT), LicenseHandler) as httpd:
+    with Server((HOST, PORT), Handler) as httpd:
         print(f"LaunchOS keygen server listening on http://{HOST}:{PORT}")
         httpd.serve_forever()
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="LaunchOS patch + keygen tool")
-    parser.add_argument(
-        "command",
-        choices=["patch", "serve", "all"],
-        help="patch=只 patch App；serve=只启动注册机；all=patch 后启动注册机",
-    )
+    parser.add_argument("command", choices=["patch", "serve", "all"])
     args = parser.parse_args()
 
-    if args.command in {"patch", "all"}:
+    if args.command in ("patch", "all"):
         patch_app()
-    if args.command in {"serve", "all"}:
+    if args.command in ("serve", "all"):
         serve()
 
 
