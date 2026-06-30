@@ -14,6 +14,7 @@ import base64
 import json
 import os
 import shutil
+import signal
 import socketserver
 import struct
 import subprocess
@@ -48,6 +49,14 @@ REPLACEMENTS = (
 def run(cmd: list[str]) -> None:
     print("+", " ".join(cmd))
     subprocess.check_call(cmd)
+
+
+def run_optional(cmd: list[str]) -> None:
+    print("+", " ".join(cmd))
+    try:
+        subprocess.check_call(cmd)
+    except subprocess.CalledProcessError as exc:
+        print(f"warn: ignored failed command, exit={exc.returncode}")
 
 
 def plist(key: str) -> str:
@@ -268,6 +277,8 @@ def patch_app() -> None:
         if not path.exists():
             raise SystemExit(f"missing: {path}")
 
+    run_optional(["pkill", "-x", "LaunchOS"])
+    time.sleep(1)
     print(f"LaunchOS version: {plist('CFBundleShortVersionString')} ({plist('CFBundleVersion')})")
     patch_binary()
     shutil.copyfile(PUBLIC_KEY, APP_PUBLIC_KEY)
@@ -281,9 +292,30 @@ def serve() -> None:
     if not PRIVATE_KEY.exists():
         raise SystemExit(f"missing: {PRIVATE_KEY}")
 
+    kill_port(PORT)
     with Server((HOST, PORT), Handler) as httpd:
         print(f"LaunchOS keygen server listening on http://{HOST}:{PORT}")
         httpd.serve_forever()
+
+
+def kill_port(port: int) -> None:
+    try:
+        out = subprocess.check_output(["lsof", "-ti", f"tcp:{port}"], text=True)
+    except subprocess.CalledProcessError:
+        return
+
+    for item in out.split():
+        try:
+            pid = int(item)
+        except ValueError:
+            continue
+        if pid == os.getpid():
+            continue
+        print(f"kill old server pid={pid}")
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
 
 
 def main() -> None:
