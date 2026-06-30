@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+from __future__ import annotations
 """
 LaunchOS patch + 本地注册机一体脚本。
 
@@ -27,7 +28,7 @@ WORK = ROOT / "launchos_keygen_work"
 PRIVATE_KEY = WORK / "private.pem"
 PUBLIC_KEY = WORK / "public.pem"
 
-APP = Path("/Applications/LaunchOS.app")
+APP = Path(os.environ.get("LAUNCHOS_APP", "/Applications/LaunchOS.app"))
 BIN = APP / "Contents/MacOS/LaunchOS"
 INFO = APP / "Contents/Info.plist"
 APP_PUBLIC_KEY = APP / "Contents/Resources/public.pem"
@@ -250,7 +251,16 @@ def patch_binary() -> None:
     else:
         raise SystemExit(f"unexpected bytes at {off:#x}: {cur.hex()}")
 
-    BIN.write_bytes(data)
+    run(["chflags", "nouchg,noschg", str(BIN)])
+    run(["chmod", "u+w", str(BIN)])
+    try:
+        BIN.write_bytes(data)
+    except PermissionError as exc:
+        raise SystemExit(
+            f"{exc}\n"
+            "写入 App 二进制失败。请确认 LaunchOS 已退出，并给 Terminal/iTerm 开启 "
+            "System Settings -> Privacy & Security -> Full Disk Access 后重试。"
+        ) from exc
 
 
 def patch_app() -> None:
