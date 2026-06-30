@@ -11,7 +11,7 @@ launchos_keygen_work/public.pem  JWT 公钥，会复制进 App
 ## 一键 patch
 
 ```bash
-sudo python3 /Users/yaozaiyu/launchosPatch/launchos_2_1_3_tool.py all
+sudo python3  launchos_tool.py all
 ```
 
 ## 激活
